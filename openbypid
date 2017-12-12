@@ -1,0 +1,195 @@
+#!/bin/sh
+#: Title       : Openbypid
+#: Date        : 2017-12-09
+#: Authors     : Written by: "Kybernetes" <correodelkybernetes@gmail.com>
+#: Version     : 1.0.0
+#: Description : Executable Dash shell script file.
+#:             : Finds the number of oppen files by a list of given processess by counting the symlinks within each
+#:             :  /proc/$pid/fd where $pid is the PID of each process.
+#: Options     : N/A
+##
+## -- Configuration globals --------------------------------------------------------------------------------------------
+## A _PIDFILE_proc Specifies a pidfile for the process "proc" to be followd
+##_PIDFILE_process=/var/run/process.pid
+_PIDFILE_tomcatA=/usr/share/tomcat/instncA/temp/tomcat.pid
+_PIDFILE_tomcatB=/usr/share/tomcat/instncB/temp/tomcat.pid
+_PIDFILE_jbossA=/usr/share/jboss-as/instncA/var/run/standalone.pid
+## 
+## Zabbix agent configuration
+_ZBBXAGENTON=true                            ## Enable?
+_ZBBXAGNTCNF=/etc/zabbix/zabbix_agentd.conf  ## Point to config file
+_ZBBXAGNTTMT=5                               ## Zabbix agent submission timeout
+##
+## -- Required for execution -------------------------------------------------------------------------------------------
+type date >/dev/null || exit 1
+type mkfifo >/dev/null || exit 1
+type ps >/dev/null || exit 1
+type sleep >/dev/null || exit 1
+if $_ZBBXAGENTON; then
+    type zabbix_sender >/dev/null || exit 1
+fi
+##
+## -- Globals ----------------------------------------------------------------------------------------------------------
+# Declare the following useful symbols:
+_RPLY=              ## Read reply
+IFS=                ## Clear the IFS in case they a messy one has been exported;
+readonly _SPC=" "   ## Space (readonly uses a word for assignment's LHS);
+readonly _TAB="	"   ## Tab;
+readonly _EOL="
+"                   ## En of line (newline);
+IFS=$_SPC$_TAB$_EOL ## Now reset de IFS as expected
+##
+## -- Auxiliary functions ----------------------------------------------------------------------------------------------
+stdmsg() { #@ DESCRIPTION: Print messages to STDOUT
+           #@ USAGE: stdmsg [ MSG ... ]
+    [ "${1+X}" = X ] && printf "%s\n" "$@"
+}
+errmsg() { #@ DESCRIPTION: Print messages to STDERR prefixed by an error stamp
+           #@ USAGE: stderr [ MSG ... ]
+    stdmsg ${1+"Error! $@"} >&2
+}
+isnul() { #@ DESCRIPTION: Tests if $1 is the null string (i.e. just \0 char).
+          #@ USAGE: isnul '[ STRING ]'
+    [ X"$1" = X ] ## Succeed when $1 is concatenation neutral
+}
+dgtnly() { #@ USAGE: Tests if $1 string contains only numeric characters
+           #@ DESCRIPTION: dgtnly [ STRNG ]
+    case $1 in                ## Test if $1 string contains nondigit chars
+        *[!0-9]*) return 1 ;; ## Contains non numeric chars
+    esac
+}
+_FFLNE=
+getFFLne() { #@ DESCRIPTION: Reads 1st line of file specified by $2 path into $1 name.
+             #@ USAGE: getFFLne NAME PATH
+    { read _FFLNE <"$2" ; } 2>/dev/null
+    case $? in
+        1) [ "X$_FFLNE" = "X" ] && return 1 ;; ## EOF reached before any EOL. If nothing was read, finish w/errors
+        [!0]*) return 2 ;;                     ## Something went wrong
+    esac
+    eval "$1=\"\$_FFLNE\"" ## Assign global value to referenced name  /!\ - $1 must be a valid shell name /!\
+}
+tmout() { #@ DESCRIPTION: Execute command w/a timeout upon whose expiration SIGTERM is sent to the process. If that is
+          #@              blocked, then subsequent SIGKILL will attempt to terminate it, after a certain delay.
+          #@ USAGE: tmout SECS COMMAND
+    ## Local variables (If local is used, it should appear as the first statement of a function)
+    local tout cmd
+    tout=$1                       ## Get first pos. par. as seconds to timeout
+    shift 1                       ## Remove it
+    cmd=$(printf '"%s" ' "$@")    ## Quote all args in a string to be used as a command safely
+    shift $#                      ## Remove all pos. pars.
+    sh -c "{                      ## Start a killer process in background
+intvl=1 dly=2 tout=$tout          ## Initialize interval, dly and timeout
+while [ \$tout -gt 0 ]; do        ## While we still have some time
+    if ! ps -o pid -p \$$; then   ## Foreground process still running? ($$ will be expanded before background)
+        wait \$$                  ## No, so wait to capture exit status
+        exit \$?                  ##     Exit w/foreground's exit stat
+    fi                            ## Yes, so..
+    sleep \$intvl                 ##      Sleep for defined interval before asking again
+    tout=\$((tout - intvl))       ## Decrease timeout
+done                              ## Now we run out of time, and the backgournd killer will do it's job
+    kill -s TERM \$$              ## Try to TERM foreground process
+    sleep \$dly                   ## Delay the KILL a bit
+    if ps -o pid -p \$$; then     ## Is foreground still running?
+        kill -s KILL \$$          ## Yes, so kill it
+        sleep \$dly               ## Await before checking again
+        if ps -o pid -p \$$; then ## If it still running then..
+            exit 3                ## Finish w/distinctive error
+        fi                        
+        exit 2                    ## Process didn't TERMINATED but KILLED
+    fi
+    exit 1                        ## Process TERMINATED
+} >/dev/null 2>&1 &               ## Fork nullifying output
+exec $cmd"                        ## Replace foreground execution w/command's
+}
+##
+## -- Main -------------------------------------------------------------------------------------------------------------
+main() {
+    ## Local variables (If local is used, it should appear as the first statement of a function)
+    local tffo procs proc pid lnks dte
+    set -- ## Discard any positional parameters
+    # Create temporary fifo as pipe replacement (better error handling)
+    tffo=/tmp/${0##*/}.$$.tmp                ## Initialize pipe's name using current script's name, and PID
+    if ! mkfifo -m 600 $tffo; then           ## Try to create pipe w/owner only rw permissions, if fail
+        errmsg "Failed to create named pipe" ## Then print error message to STDERR
+        return 1                             ## Finish execution w/errors
+    fi
+    # Get list of global _PIDFILEs separated by colon
+    set >$tffo 2>/dev/null &                         ## Send global variable list to pipe in background
+    procs=                                           ## Initialize procs list
+    { while IFS= read -r _RPLY; do                   ## Read from pipe the variable list line by line
+          case $_RPLY in                             ## Filter the reply
+              _PIDFILE_*)                            ## Must be prefixed as defined in "Configuration Globals" section
+                  _RPLY=${_RPLY%%=*}                 ## Remove assignment part from the back of the string
+                  procs=$procs${_RPLY#_PIDFILE_}: ;; ## Extract process name from reply and append it to list
+          esac
+      done <$tffo ; } 2>/dev/null                    ## IO redir for loop to read from pipe and scilence shell errors
+    if [ $? -gt 1 ]; then                            ## $?=1 when EOF is reached, $?>1 when unable to open fifo
+        errmsg "Failed to read from named pipe"      ## Print error message to STDERR when failed to read from pipe
+        rm -f $tffo                                  ## Clean up
+        return 2                                     ## And finish execution
+    fi                                               ## Now sure that read loop finished successfully
+    if ! wait $!; then                               ## Check exit status from previously backgrounded
+        errmsg "Failed to get global names"          ## Print error message if backgrounded finished w/errors
+        rm -f $tffo                                  ## Clean up
+        return 3                                     ## And finish w/errors since we cannot trust what we read from pipe
+    fi                                               ## Now sure about list of globals
+    # Validate readed procs list
+    case $procs in                                       ## Check on process list value
+        *[!a-zA-Z_:]* | *::*)                            ## Contains non alphabetic or non consecutive colon chars?
+            errmsg "Invalid process list read from pipe" ## Print error message to STDERR
+            rm -f $tffo                                  ## Clean up
+            return 4 ;;                                  ## And finish w/errors
+    esac
+    if isnul "$procs"; then                              ## Still, we may have read an empty list
+        stdmsg "No defined processes to check"           ## This is not an error, but should be reported
+        rm -f $tffo                                      ## And since it is pointless to continue
+        return 0                                         ## Clean up and finish
+    fi                                                   ## Now sure about a valid nonempty process list
+    # Print report for each process in the list        
+    date +'%Y-%m-%d %T' >$tffo 2>/dev/null &                                        ## Get current current date to fifo
+    if ! { getFFLne dte $tffo && wait $! ; }; then                                  ## Fail to read pipe or date failed?
+        dte="'000-00-00 00:00:00"                                                   ## Set dummy timestamp as date
+    fi
+    printf "\n$dte -------------------------\n"                                     ## Print a separator w/current date
+    while ! isnul $procs; do                                                        ## Loop 'till procs is null string
+        proc=${procs%%:*}                                                           ## Get current proc from procs
+        printf "Process: \t%s\n" "$proc"                                            ## Display current process name
+        if ! eval "getFFLne pid \"\$_PIDFILE_$proc\""; then                         ## Try to get PID from pidfile
+            printf "PID: \t\t%-s\nOpen files: \t%-s\n" "Failed to read" "N/A"       ## Error when above fails
+        elif ! dgtnly "$pid"; then                                                  ## Check for digits only pid
+            printf "PID: \t\t%-s\nOpen files: \t%-s\n" "Bad pid read" "N/A"         ## Error when above fails
+        else                                                                        ## Now sure about $pid value
+            printf "%s\n" "/proc/$pid/fd"/* >$tffo 2>/dev/null &                    ## Pid's links to pipe in backgrnd
+            lnks=0                                                                  ## Initialize links counter
+            { while IFS= read -r _RPLY; do                                          ## Read links list line by line
+                  [ -h "$_RPLY" ] && lnks=$((lnks + 1))                             ## Count when is-link test passed
+              done <$tffo ; } 2>/dev/null                                           ## IO redir for loop to read pipe
+            if [ $? -gt 1 ]; then                                                   ## $?>1 for fail to open
+                printf "PID: \t\t%-d\nOpen files: \t%-s\n" $pid "Read pipe error"   ## Error when above happens
+            elif ! wait $!; then                                                    ## Trust list to pipe in backgrnd?
+                printf "PID: \t\t%-d\nOpen files: \t%-s\n" $pid "List fds error"    ## Error when above's answer is no
+            elif [ $lnks -eq 0 -a ! -d /proc/$pid ]; then                           ## 0 Links? Check for unning pid
+                printf "PID: \t\t%-d\nOpen files: \t%-s\n" $pid "Not running"       ## Not running if dir doesn't exists
+            else                                                                    ## Now sure about links number
+                printf "PID: \t\t%-d\nOpen files: \t%-d\n" $pid $lnks               ## So print info to report
+                if $_ZBBXAGENTON; then                                              ## Check if zabbix enabled
+                    if ! tmout $_ZBBXAGNTTMT\
+                         zabbix_sender -c "$_ZBBXAGNTCNF"\
+                                       -k "openfiles[$proc]"\
+                                       -o $lnks >/dev/null 2>&1                     ## Try to send key value to Zbbx Srv
+                    then                                                            ## Use agent options and timeout
+                        errmsg "Zabbix_sender failed to send key value"             ## Report error on failuer
+                    else
+                        stdmsg "Zabbix_sender key value sent"                       ## Report success
+                    fi
+                fi
+            fi
+        fi
+        stdmsg ""                                                                   ## Print a separator by process
+        procs=${procs#$proc:}                                                       ## Remove current proc from list
+    done
+    rm -f $tffo                                                                     ## Clean before finish
+}
+##
+## -- Run! -------------------------------------------------------------------------------------------------------------
+main "$@"
