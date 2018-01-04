@@ -1,8 +1,8 @@
 #!/bin/sh
 #: Title       : Openbypid
-#: Date        : 2017-12-09
+#: Date        : 2018-01-03
 #: Authors     : Written by: "Kybernetes" <correodelkybernetes@gmail.com>
-#: Version     : 1.0.0
+#: Version     : 1.1.0
 #: Description : Executable Dash shell script file.
 #:             : Finds the number of oppen files by a list of given processess by counting the symlinks within each
 #:             :  /proc/$pid/fd where $pid is the PID of each process.
@@ -25,6 +25,7 @@ type date >/dev/null || exit 1
 type mkfifo >/dev/null || exit 1
 type ps >/dev/null || exit 1
 type sleep >/dev/null || exit 1
+type file >/dev/null || exit 1
 if $_ZBBXAGENTON; then
     type zabbix_sender >/dev/null || exit 1
 fi
@@ -51,6 +52,13 @@ errmsg() { #@ DESCRIPTION: Print messages to STDERR prefixed by an error stamp
 isnul() { #@ DESCRIPTION: Tests if $1 is the null string (i.e. just \0 char).
           #@ USAGE: isnul '[ STRING ]'
     [ X"$1" = X ] ## Succeed when $1 is concatenation neutral
+}
+sbstr() { #@ DESCRIPTION: Tests if $1 is a substring fo $2
+          #@ USAGE: sbstr '[ STRNG1 ]' '[ STRNG2 ]'
+    case $2 in
+        *$1*) return 0 ;;
+    esac
+    return 1
 }
 dgtnly() { #@ USAGE: Tests if $1 string contains only numeric characters
            #@ DESCRIPTION: dgtnly [ STRNG ]
@@ -101,11 +109,16 @@ done                              ## Now we run out of time, and the backgournd 
 } >/dev/null 2>&1 &               ## Fork nullifying output
 exec $cmd"                        ## Replace foreground execution w/command's
 }
+pidrprt() { #@ DESCRIPTION: Prints report of $1 pid, showing $2
+            #@ USAGE: pidrprt PID LINKS SOCKETS
+    printf "PID: \t\t%-s\nOpen files: \t%-s\nSockets: \t%-s\n" \
+           "$1" "$2" "$3"
+}
 ##
 ## -- Main -------------------------------------------------------------------------------------------------------------
 main() {
     ## Local variables (If local is used, it should appear as the first statement of a function)
-    local tffo procs proc pid lnks dte
+    local tffo procs proc dte pid lnks scks
     set -- ## Discard any positional parameters
     # Create temporary fifo as pipe replacement (better error handling)
     tffo=/tmp/${0##*/}.$$.tmp                ## Initialize pipe's name using current script's name, and PID
@@ -146,49 +159,57 @@ main() {
         return 0                                         ## Clean up and finish
     fi                                                   ## Now sure about a valid nonempty process list
     # Print report for each process in the list        
-    date +'%Y-%m-%d %T' >$tffo 2>/dev/null &                                        ## Get current current date to fifo
-    if ! { getFFLne dte $tffo && wait $! ; }; then                                  ## Fail to read pipe or date failed?
-        dte="'000-00-00 00:00:00"                                                   ## Set dummy timestamp as date
+    date +'%Y-%m-%d %T' >$tffo 2>/dev/null &                        ## Get current current date to fifo
+    if ! { getFFLne dte $tffo && wait $! ; }; then                  ## Fail to read pipe or date failed?
+        dte="'000-00-00 00:00:00"                                   ## Set dummy timestamp as date
     fi
-    printf "\n$dte -------------------------\n"                                     ## Print a separator w/current date
-    while ! isnul $procs; do                                                        ## Loop 'till procs is null string
-        proc=${procs%%:*}                                                           ## Get current proc from procs
-        printf "Process: \t%s\n" "$proc"                                            ## Display current process name
-        if ! eval "getFFLne pid \"\$_PIDFILE_$proc\""; then                         ## Try to get PID from pidfile
-            printf "PID: \t\t%-s\nOpen files: \t%-s\n" "Failed to read" "N/A"       ## Error when above fails
-        elif ! dgtnly "$pid"; then                                                  ## Check for digits only pid
-            printf "PID: \t\t%-s\nOpen files: \t%-s\n" "Bad pid read" "N/A"         ## Error when above fails
-        else                                                                        ## Now sure about $pid value
-            printf "%s\n" "/proc/$pid/fd"/* >$tffo 2>/dev/null &                    ## Pid's links to pipe in backgrnd
-            lnks=0                                                                  ## Initialize links counter
-            { while IFS= read -r _RPLY; do                                          ## Read links list line by line
-                  [ -h "$_RPLY" ] && lnks=$((lnks + 1))                             ## Count when is-link test passed
-              done <$tffo ; } 2>/dev/null                                           ## IO redir for loop to read pipe
-            if [ $? -gt 1 ]; then                                                   ## $?>1 for fail to open
-                printf "PID: \t\t%-d\nOpen files: \t%-s\n" $pid "Read pipe error"   ## Error when above happens
-            elif ! wait $!; then                                                    ## Trust list to pipe in backgrnd?
-                printf "PID: \t\t%-d\nOpen files: \t%-s\n" $pid "List fds error"    ## Error when above's answer is no
-            elif [ $lnks -eq 0 -a ! -d /proc/$pid ]; then                           ## 0 Links? Check for unning pid
-                printf "PID: \t\t%-d\nOpen files: \t%-s\n" $pid "Not running"       ## Not running if dir doesn't exists
-            else                                                                    ## Now sure about links number
-                printf "PID: \t\t%-d\nOpen files: \t%-d\n" $pid $lnks               ## So print info to report
-                if $_ZBBXAGENTON; then                                              ## Check if zabbix enabled
+    printf "\n$dte -------------------------\n"                     ## Print a separator w/current date
+    while ! isnul $procs; do                                        ## Loop 'till procs is null string
+        proc=${procs%%:*}                                           ## Get current proc from procs
+        printf "Process: \t%s\n" "$proc"                            ## Display current process name
+        if ! eval "getFFLne pid \"\$_PIDFILE_$proc\""; then         ## Try to get PID from pidfile
+            pidrprt "Failed to read" "N/A" "N/A"                    ## Error report when above fails            
+        elif ! dgtnly "$pid"; then                                  ## Check for digits only pid
+            pidrprt "Bad value read" "N/A" "N/A"                    ## Error report when above fails
+        else                                                        ## Now sure about $pid value
+            file -- "/proc/$pid/fd"/* >$tffo 2>/dev/null &          ## Pid's fds to pipe in backgrnd
+            lnks=0 scks=0                                           ## Initialize links/sockets counter
+            { while IFS= read -r _RPLY; do                          ## Read fds from pipe line by line
+                  case ${_RPLY%%:*} in                              ## Sanity check upon each line
+                      /proc/$pid/fd/*[!0-9]) continue ;;            ## Skip when basename contains non-digits
+                  esac                                                  
+                  if [ -h "${_RPLY%%:*}" ]; then                    ## Extract and test path part of file's output
+                      lnks=$((lnks + 1))                            ## Count when is-link test passed
+                      sbstr "socket" "$_RPLY" && scks=$((scks + 1)) ## Count when is-socket test passed
+                  fi                   
+              done <$tffo ; } 2>/dev/null                           ## IO redir for loop to read pipe
+            if [ $? -gt 1 ]; then                                   ## $?>1 for fail to open
+                pidrprt $pid "Read pipe error" "Read pipe error"    ## Error report when above happens
+            elif ! wait $!; then                                    ## Trust list to pipe in backgrnd?
+                pidrprt $pid "Fd list error" "Fd list error"        ## Error report when above's answer is no
+            elif [ $lnks -eq 0 -a ! -d /proc/$pid ]; then           ## 0 Links? Check for unning pid
+                pidrprt $pid "Not running" "Not running"            ## Not running if dir doesn't exists
+            else                                                    ## Now sure about links number
+                pidrprt $pid $lnks $scks                            ## So print PID's report
+                if $_ZBBXAGENTON; then                              ## Check if zabbix enabled
                     if ! tmout $_ZBBXAGNTTMT\
                          zabbix_sender -c "$_ZBBXAGNTCNF"\
-                                       -k "openfiles[$proc]"\
-                                       -o $lnks >/dev/null 2>&1                     ## Try to send key value to Zbbx Srv
-                    then                                                            ## Use agent options and timeout
-                        errmsg "Zabbix_sender failed to send key value"             ## Report error on failuer
+                                       -i - >/dev/null 2>&1 <<EOF
+- openfiles[$proc] $lnks
+- opensocks[$proc] $scks
+EOF
+                    then                                                ## Try to send key value to Zbbx Srv
+                        errmsg "Zabbix_sender failed to send key value" ## Report error on failure
                     else
-                        stdmsg "Zabbix_sender key value sent"                       ## Report success
+                        stdmsg "Zabbix_sender key value sent"           ## Report success                        
                     fi
                 fi
             fi
         fi
-        stdmsg ""                                                                   ## Print a separator by process
-        procs=${procs#$proc:}                                                       ## Remove current proc from list
+        stdmsg ""                                                       ## Print a separator by process
+        procs=${procs#$proc:}                                           ## Remove current proc from list
     done
-    rm -f $tffo                                                                     ## Clean before finish
+    rm -f $tffo                                                         ## Clean before finish
 }
 ##
 ## -- Run! -------------------------------------------------------------------------------------------------------------
